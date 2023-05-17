@@ -1,0 +1,133 @@
+import pycalculix as pyc
+import pycalculix.results_file
+import numpy as np
+from scipy import interpolate
+import matplotlib.pyplot as plt
+import math
+
+
+def evaluate_non_uniformity(f_strain, x_mid, x_l):
+    x_i = np.linspace(x_mid-x_l/2, x_mid+x_l/2, 100)
+    e_i = f_strain(x_i).ravel()
+    return np.mean(e_i), np.abs(np.std(e_i)/np.mean(e_i)*100)
+
+
+def create_sensor_geometry(part, a, b, n, height, length):
+    line_loop = [ [0, height], [length, 0],  [0, -height],  [-length, 0], ]
+    part.goto(-length / 2, -height / 2)
+    lines = []
+    for [drad, dax] in line_loop:
+        [L, p1, p2] = part.draw_line_delta(drad, dax)
+        lines.append(L)
+
+    n_div = 50
+    delta_phi = np.pi / n_div * 2
+    t = np.linspace(0, np.pi * 2 - delta_phi, n_div - 1)
+    x = (((np.abs(np.cos(t))) ** (2 / n)) * a * np.sign(np.cos(t)))
+    y = (((np.abs(np.sin(t))) ** (2 / n)) * b * np.sign(np.sin(t)))
+    dx = (np.diff(x)).reshape(-1, 1)
+    dy = (np.diff(y)).reshape(-1, 1)
+    line_loop = np.hstack((dx, dy))
+
+    part.goto(x[0], y[0])
+    lines = []
+    for [drad, dax] in line_loop:
+        [L, p1, p2] = part.draw_line_delta(drad, dax)
+        lines.append(L)
+    part.draw_line_delta(-x[-1] + x[0], -y[-1] + y[0])
+    return part
+
+
+def calculate_volume(a, b, n, height, length, width):
+    Vd = (0.25*math.pi*(math.pow(0.025, 2)) - (height*width))*length*1000
+    Vv = 4*a*b*(((math.gamma(1+(1/n)))**2)/(math.gamma(1+(2/n))))*width*1000
+    return Vd, Vv
+
+
+def get_indicator(prob, height, E, materials_array, Vd, Vv):
+    #st.write('Начало расчета')
+    rx, yx, Sx, Sy, Sz = prob.rfile.get_nodal_strain()
+    #st.write('Данные импротированы')
+    rx = np.array(rx)
+    yx = np.array(yx)
+
+    Sx = np.array(Sx)
+    er = Sx/E
+
+    sf = 0
+    t = 0
+
+    for i in range(0, 3):
+        if (E == materials_array[i, 0]):
+            Seqv = prob.rfile.get_nmax('Seqv')
+            sf = materials_array[i, 2]/Seqv
+            t = (Vd + Vv)/materials_array[i, 1]
+            break
+
+    y_filter = np.abs(yx - height / 2) < 0.0000001
+
+    rx = rx[y_filter]
+    er = er[y_filter]
+
+    f = interpolate.interp1d(rx, er)
+
+    imin = np.argmin(er)
+    imax = np.argmax(er)
+
+    e_1, e_1_std = evaluate_non_uniformity(f, rx[imin], 0.003)
+    e_2, e_2_std = evaluate_non_uniformity(f, rx[imax], 0.003)
+
+    rkp = -1000 * (e_1 - e_2)
+
+    nl_surrogate = np.abs(np.abs(max(np.abs(e_1), np.abs(e_2)) / min(np.abs(e_1), np.abs(e_2))) - 1)
+
+    nu = max(e_1_std, e_2_std)
+
+    return rkp, nl_surrogate, nu, sf, t, rx, er
+
+
+def sim_beam_sensor(a, b, n, E, materials_array, height=0.02, length=0.1, width=0.01, f=50):
+    try:
+        # create new model
+        model = pyc.FeaModel('beam_sensor')
+        model.set_units('m')
+        part = pyc.Part(model)
+
+        # create geometry
+        create_sensor_geometry(part, a, b, n, height, length)
+        Vd, Vv = calculate_volume(a, b, n, height, length, width)
+
+        # mesh
+        model.set_eshape('tri', 2)
+        # толщина датчика 1 см
+        # model.set_ediv('L2', 50)
+        # model.set_ediv('L3', 50)
+        model.set_etype('plstress', part, width)
+        model.mesh(0.3, 'fineness', 'gmsh')
+        
+        # force = 50 H
+        model.set_constr('fix', part.top, 'x')
+        model.set_constr('fix', part.top, 'y')
+        model.set_load('force', part.bottom, f, 'y')
+        model.plot_elements('11', display=True)
+        #model.plot_constraints('33', display=True)
+
+        # material properties
+        mat = model.make_matl('alum')
+        mat.set_mech_props(2800, 0.7e11, 0.3)
+        model.set_matl(mat, part)
+
+        prob = pyc.Problem(model, 'struct', r'C:\Users\danko\PycharmProjects\project_vkr_1\beam_sensor')
+        prob.solve()
+
+        return get_indicator(prob, height, E, materials_array, Vd, Vv)
+
+    except:
+        print('Calculation failed for some ungodly reason')
+        return None, None, None, None, None, None, None
+
+
+if __name__ == "__main__":
+    materials_array = np.array([[200e9, 55, 835e6], [70e9, 85, 300e6], [112e9, 25, 376e6]])
+    rkp, nl_surrogate, nu, sf, t, rx, er = sim_beam_sensor(0.04, 0.004, 2.28, 112e9, materials_array)
+    print('РКП =', rkp,' Nl =', nl_surrogate,' v =', nu,' n =', sf,' t =', t)
